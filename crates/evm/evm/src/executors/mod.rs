@@ -68,7 +68,9 @@ mod builder;
 pub use builder::ExecutorBuilder;
 
 pub mod fuzz;
-pub use fuzz::FuzzedExecutor;
+pub use fuzz::{
+    FuzzedExecutor, HybridFuzzAssist, HybridFuzzSolve, HybridFuzzSolver, HybridFuzzTarget,
+};
 
 pub mod invariant;
 pub use invariant::InvariantExecutor;

@@ -20,6 +20,8 @@ pub struct CaseOutcome {
     pub debug_bytecodes: AddressHashMap<Bytes>,
     /// The coverage info collected during the call.
     pub coverage: Option<HitMaps>,
+    /// Whether the input expanded the worker's edge coverage.
+    pub new_coverage: bool,
     /// Breakpoints char pc map.
     pub breakpoints: Breakpoints,
     /// logs of a single fuzz test case.

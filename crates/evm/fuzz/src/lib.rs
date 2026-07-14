@@ -305,7 +305,102 @@ impl fmt::Display for BaseCounterExample {
     }
 }
 
-/// The outcome of a fuzz test
+/// High-level reason a managed hybrid fuzz assist did not produce replay calldata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HybridFuzzIncompleteKind {
+    /// The branch was reached but no concrete branch-flipping input was materialized.
+    NoInput,
+    /// The symbolic executor reached an unsupported or bounded semantic edge.
+    Stuck,
+    /// Every explored symbolic path reverted before producing replay calldata.
+    RevertAll,
+    /// The symbolic executor or solver exhausted its timeout.
+    Timeout,
+    /// Input decoding, backend access, or solver process setup failed.
+    Error,
+}
+
+/// The outcome of a fuzz test.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HybridFuzzStats {
+    /// Bounded symbolic assists started after a concrete coverage plateau.
+    pub attempts: u32,
+    /// Symbolic assists that produced concrete calldata for replay.
+    pub candidates: u32,
+    /// Symbolic assists that finished without producing replay calldata.
+    pub incomplete: u32,
+    /// Incomplete assists that reached the target but produced no concrete input.
+    pub incomplete_no_input: u32,
+    /// Incomplete assists stopped on symbolic executor semantic or resource bounds.
+    pub incomplete_stuck: u32,
+    /// Incomplete assists where all symbolic paths reverted.
+    pub incomplete_revert_all: u32,
+    /// Incomplete assists stopped on solver or wall-clock timeout.
+    pub incomplete_timeout: u32,
+    /// Incomplete assists stopped on an internal, backend, or solver setup error.
+    pub incomplete_error: u32,
+    /// Replayed symbolic candidates that expanded concrete edge coverage.
+    pub useful_candidates: u32,
+    /// Replayed symbolic candidates preserved for later corpus replay without new edge coverage.
+    pub corpus_candidates: u32,
+    /// Replayed symbolic candidates that exposed a concrete counterexample.
+    pub counterexamples: u32,
+}
+
+impl HybridFuzzStats {
+    pub const fn is_empty(&self) -> bool {
+        self.attempts == 0
+            && self.candidates == 0
+            && self.incomplete == 0
+            && self.incomplete_no_input == 0
+            && self.incomplete_stuck == 0
+            && self.incomplete_revert_all == 0
+            && self.incomplete_timeout == 0
+            && self.incomplete_error == 0
+            && self.useful_candidates == 0
+            && self.corpus_candidates == 0
+            && self.counterexamples == 0
+    }
+
+    pub const fn merge(&mut self, other: Self) {
+        self.attempts = self.attempts.saturating_add(other.attempts);
+        self.candidates = self.candidates.saturating_add(other.candidates);
+        self.incomplete = self.incomplete.saturating_add(other.incomplete);
+        self.incomplete_no_input =
+            self.incomplete_no_input.saturating_add(other.incomplete_no_input);
+        self.incomplete_stuck = self.incomplete_stuck.saturating_add(other.incomplete_stuck);
+        self.incomplete_revert_all =
+            self.incomplete_revert_all.saturating_add(other.incomplete_revert_all);
+        self.incomplete_timeout = self.incomplete_timeout.saturating_add(other.incomplete_timeout);
+        self.incomplete_error = self.incomplete_error.saturating_add(other.incomplete_error);
+        self.useful_candidates = self.useful_candidates.saturating_add(other.useful_candidates);
+        self.corpus_candidates = self.corpus_candidates.saturating_add(other.corpus_candidates);
+        self.counterexamples = self.counterexamples.saturating_add(other.counterexamples);
+    }
+
+    pub const fn record_incomplete(&mut self, kind: HybridFuzzIncompleteKind) {
+        self.incomplete = self.incomplete.saturating_add(1);
+        match kind {
+            HybridFuzzIncompleteKind::NoInput => {
+                self.incomplete_no_input = self.incomplete_no_input.saturating_add(1);
+            }
+            HybridFuzzIncompleteKind::Stuck => {
+                self.incomplete_stuck = self.incomplete_stuck.saturating_add(1);
+            }
+            HybridFuzzIncompleteKind::RevertAll => {
+                self.incomplete_revert_all = self.incomplete_revert_all.saturating_add(1);
+            }
+            HybridFuzzIncompleteKind::Timeout => {
+                self.incomplete_timeout = self.incomplete_timeout.saturating_add(1);
+            }
+            HybridFuzzIncompleteKind::Error => {
+                self.incomplete_error = self.incomplete_error.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// The outcome of a fuzz test.
 #[derive(Debug, Default)]
 pub struct FuzzTestResult {
     /// we keep this for the debugger
@@ -357,6 +452,9 @@ pub struct FuzzTestResult {
 
     /// Number of failed replays from persisted corpus.
     pub failed_corpus_replays: usize,
+
+    /// Managed symbolic-assist telemetry for hybrid campaigns.
+    pub hybrid: HybridFuzzStats,
 }
 
 impl FuzzTestResult {

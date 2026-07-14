@@ -2823,17 +2823,15 @@ contract ForgeFuzzFrontierTest {
         let frontier = frontiers
             .iter()
             .find(|frontier| {
-                frontier["site"]["opcode_name"] == "LT"
-                    && frontier["operands"]["lhs"] == "0x64"
+                frontier["site"]["opcode_name"] == "GT"
                     && frontier["operands"]["rhs"] == "0x64"
                     && frontier["operands"]["result"] == false
             })
             .unwrap_or_else(|| panic!("missing missed fee multiplier frontier in {artifact:#}"));
         assert!(frontier["id"].as_u64().is_some(), "{frontier:#}");
         assert_eq!(frontier["call_index"], 0);
-        assert_eq!(frontier["site"]["opcode_name"], "LT");
+        assert_eq!(frontier["site"]["opcode_name"], "GT");
         assert!(frontier["site"]["pc"].as_u64().is_some(), "{frontier:#}");
-        assert_eq!(frontier["operands"]["operand_delta"], "0x0");
         assert_eq!(frontier["operands"]["result"], false);
 
         // `new_coverage` is only recorded when edge coverage is collected; frontier-only capture
@@ -2854,7 +2852,14 @@ contract ForgeFuzzFrontierTest {
         let expected_selector =
             hex::encode(&alloy_primitives::keccak256(b"testFuzz_frontier(uint64,uint256)")[..4]);
         assert!(calldata.starts_with(&format!("0x{expected_selector}")), "{calldata}");
-        assert!(calldata.ends_with(&format!("{:064x}{:064x}", 100u64, 100u64)), "{calldata}");
+        let calldata = hex::decode(&calldata[2..]).unwrap();
+        let fee_multiplier = U256::from_be_slice(&calldata[36..68]);
+        assert_eq!(frontier["operands"]["lhs"], format!("{fee_multiplier:#x}"));
+        assert!(fee_multiplier <= U256::from(100));
+        assert_eq!(
+            frontier["operands"]["operand_delta"],
+            format!("{:#x}", U256::from(101) - fee_multiplier)
+        );
     };
     assert_frontier_artifact("fuzz_frontiers", false);
 

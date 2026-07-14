@@ -325,6 +325,23 @@ impl From<ShowmapDomainArg> for ShowmapDomain {
     }
 }
 
+/// Execution engine used by a long-running `forge fuzz run` campaign.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum FuzzEngineArg {
+    /// Run the concrete coverage-guided fuzzer only.
+    #[default]
+    Concrete,
+    /// Let one fuzz worker request bounded symbolic help after coverage stalls.
+    Hybrid,
+}
+
+impl FuzzEngineArg {
+    const fn is_hybrid(self) -> bool {
+        matches!(self, Self::Hybrid)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TestExecutionOptions {
     pub(crate) coverage: bool,
@@ -399,6 +416,10 @@ fn sources_to_compile_from_artifacts(
 #[derive(Clone, Debug, Parser)]
 #[command(next_help_heading = "Campaign options")]
 pub struct CampaignArgs {
+    /// Campaign engine. Hybrid mode adds bounded symbolic assistance after coverage stalls.
+    #[arg(long, value_enum, default_value_t)]
+    pub engine: FuzzEngineArg,
+
     /// Number of runs to execute for each fuzz or invariant campaign.
     #[arg(long, value_name = "RUNS")]
     pub runs: Option<u64>,
@@ -506,6 +527,10 @@ pub struct TestArgs {
     /// Internal mode used by `forge fuzz`.
     #[arg(skip)]
     fuzz_only: FuzzOnlyMode,
+
+    /// Internal engine selected by `forge fuzz run`.
+    #[arg(skip)]
+    fuzz_engine: FuzzEngineArg,
 
     /// Internal showmap/replay override used by `forge fuzz replay`.
     #[arg(skip)]
@@ -1347,6 +1372,7 @@ impl TestArgs {
     }
 
     fn apply_fuzz_run_campaign(&mut self, campaign: CampaignArgs) {
+        self.fuzz_engine = campaign.engine;
         self.fuzz_seed = campaign.seed;
         self.fuzz_runs = campaign.runs;
         self.invariant_runs_override = campaign.runs;
@@ -2451,6 +2477,7 @@ impl TestArgs {
             .with_multi_network(execution.multi_network)
             .with_showmap(showmap)
             .with_fuzz_only(self.fuzz_only.is_enabled())
+            .with_hybrid_fuzz(self.fuzz_engine.is_hybrid())
             .with_fuzz_failure_replay(self.fuzz_failure_replay)
             .with_symbolic_artifact_replay(execution.replay_symbolic_artifact)
             .build::<FEN, MultiCompiler>(output, evm_env, tx_env, evm_opts)?;
@@ -4029,6 +4056,14 @@ mod tests {
             figment.extract_inner::<InvariantWorkers>("invariant.workers").unwrap(),
             InvariantWorkers::Fixed(std::num::NonZeroUsize::new(2).unwrap())
         );
+    }
+
+    #[test]
+    fn fuzz_run_adapter_selects_hybrid_engine() {
+        let args = FuzzRunArgs::parse_from(["foundry-cli", "--engine", "hybrid"]);
+        let args = TestArgs::from_fuzz_run(args);
+
+        assert_eq!(args.fuzz_engine, FuzzEngineArg::Hybrid);
     }
 
     #[test]

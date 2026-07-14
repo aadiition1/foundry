@@ -33,16 +33,17 @@ use foundry_common::{TestFunctionExt, TestFunctionKind, contracts::ContractsByAd
 use foundry_compilers::utils::canonicalized;
 use foundry_config::{
     Config, FuzzConfig, FuzzCorpusConfig, FuzzDictionaryConfig, InlineConfig, InvariantConfig,
+    SymbolicConfig,
 };
 use foundry_evm::{
     constants::{CALLER, CHEATCODE_ADDRESS, MAGIC_ASSUME},
     core::evm::FoundryEvmNetwork,
     decode::{RevertDecoder, SkipReason},
     executors::{
-        CallResult, EvmError, Executor, ITest, InvariantReplayOptions, MinimizationReplayInput,
-        RawCallResult, ShowmapOpts, ShowmapReplayTarget, StatelessReplayTarget,
-        canonical_replay_dirs,
-        fuzz::FuzzedExecutor,
+        CallResult, EvmError, Executor, FuzzedExecutor, ITest, InvariantReplayOptions,
+        MinimizationReplayInput, RawCallResult, ShowmapOpts, ShowmapReplayTarget,
+        StatelessReplayTarget, canonical_replay_dirs,
+        fuzz::{HybridFuzzAssist, HybridFuzzSolve, HybridFuzzTarget},
         invariant::{
             CheckSequenceFailureSite, CheckSequenceOptions, CheckSequenceOutcome,
             HandlerAssertionFailure, InvariantExecutor, InvariantFuzzError, check_sequence,
@@ -53,7 +54,8 @@ use foundry_evm::{
         replay_sequence_for_minimization,
     },
     fuzz::{
-        BasicTxDetails, CallDetails, CounterExample, FuzzFixtures, fixture_name,
+        BasicTxDetails, CallDetails, CounterExample, FuzzFixtures, HybridFuzzIncompleteKind,
+        fixture_name,
         invariant::{
             FuzzRunIdentifiedContracts, InvariantContract, InvariantSettings, SenderFilters,
             is_optimization_invariant,
@@ -92,6 +94,67 @@ use tracing::Span;
 ///
 /// `address(uint160(uint256(keccak256("foundry library deployer"))))`
 pub const LIBRARY_DEPLOYER: Address = address!("0x1F95D37F27EA0dEA9C252FC09D5A6eaA97647353");
+
+// Hybrid assists replace one fuzz worker temporarily, but still use deliberately smaller symbolic
+// bounds than an explicit `forge test --symbolic` proof. These are starting policy values to be
+// tuned against the paired DeFi benchmark matrix before this draft is marked ready.
+const HYBRID_SYMBOLIC_TIMEOUT_SECS: u32 = 3;
+const HYBRID_SYMBOLIC_MAX_PATHS: u32 = 128;
+const HYBRID_SYMBOLIC_MAX_QUERIES: u32 = 512;
+const HYBRID_SYMBOLIC_MAX_DYNAMIC_LENGTH: u32 = 16;
+const HYBRID_SYMBOLIC_MAX_CALLDATA_BYTES: u32 = 1024;
+
+fn managed_hybrid_symbolic_config(config: &SymbolicConfig) -> SymbolicConfig {
+    let mut managed = config.clone();
+    managed.enabled = true;
+    managed.seed_corpus = false;
+    managed.use_fuzz_corpus = false;
+    managed.use_fuzz_frontiers = false;
+    let timeout = managed
+        .timeout
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(HYBRID_SYMBOLIC_TIMEOUT_SECS)
+        .min(HYBRID_SYMBOLIC_TIMEOUT_SECS);
+    managed.timeout = Some(timeout);
+    managed.depth = None;
+    managed.max_paths = managed.path_width().min(HYBRID_SYMBOLIC_MAX_PATHS);
+    managed.width = None;
+    managed.max_solver_queries = managed.max_solver_queries.min(HYBRID_SYMBOLIC_MAX_QUERIES);
+    managed.default_dynamic_length =
+        managed.default_dynamic_length.min(HYBRID_SYMBOLIC_MAX_DYNAMIC_LENGTH);
+    managed.max_dynamic_length = managed.max_dynamic_length.min(HYBRID_SYMBOLIC_MAX_DYNAMIC_LENGTH);
+    managed.max_calldata_bytes = managed.max_calldata_bytes.min(HYBRID_SYMBOLIC_MAX_CALLDATA_BYTES);
+    for length in &mut managed.array_lengths {
+        *length = (*length).min(HYBRID_SYMBOLIC_MAX_DYNAMIC_LENGTH);
+    }
+    for lengths in managed.dynamic_lengths.values_mut() {
+        for length in lengths {
+            *length = (*length).min(HYBRID_SYMBOLIC_MAX_DYNAMIC_LENGTH);
+        }
+    }
+    for length in &mut managed.default_array_lengths {
+        *length = (*length).min(HYBRID_SYMBOLIC_MAX_DYNAMIC_LENGTH);
+    }
+    for length in &mut managed.default_bytes_lengths {
+        *length = (*length).min(HYBRID_SYMBOLIC_MAX_DYNAMIC_LENGTH);
+    }
+    managed.symbolic_call_targets = false;
+    // A managed assist runs one built-in solver process; explicit symbolic runs remain the place
+    // for custom solver commands, portfolio races, and verbose SMT dumps.
+    managed.solver_command = None;
+    managed.solver_portfolio.clear();
+    managed.dump_smt = false;
+    managed
+}
+
+const fn hybrid_incomplete_kind(kind: SymbolicStopReason) -> HybridFuzzIncompleteKind {
+    match kind {
+        SymbolicStopReason::Stuck => HybridFuzzIncompleteKind::Stuck,
+        SymbolicStopReason::RevertAll => HybridFuzzIncompleteKind::RevertAll,
+        SymbolicStopReason::Timeout => HybridFuzzIncompleteKind::Timeout,
+        SymbolicStopReason::Error => HybridFuzzIncompleteKind::Error,
+    }
+}
 
 fn should_symbolically_seed_fuzz_corpus(config: &Config, func: &Function) -> bool {
     config.symbolic.seed_corpus && func.test_function_kind().is_fuzz_test()
@@ -442,6 +505,94 @@ mod tests {
             .and_then(|value| value.strip_suffix(".json"))
             .expect("file name should include sanitized value prefix and json suffix");
         assert_eq!(hash.len(), 32);
+    }
+
+    #[test]
+    fn managed_hybrid_symbolic_config_bounds_resource_use() {
+        let config = SymbolicConfig {
+            enabled: false,
+            seed_corpus: true,
+            use_fuzz_corpus: true,
+            use_fuzz_frontiers: true,
+            timeout: Some(30),
+            width: Some(1_024),
+            max_paths: 1_024,
+            max_solver_queries: 10_000,
+            solver_command: Some("custom-solver --flag".to_string()),
+            solver_portfolio: vec!["z3".to_string(), "cvc5".to_string()],
+            default_dynamic_length: 64,
+            max_dynamic_length: 512,
+            array_lengths: vec![4, 128],
+            dynamic_lengths: [("arg".to_string(), vec![2, 256])].into(),
+            default_array_lengths: vec![3, 64],
+            default_bytes_lengths: vec![5, 256],
+            max_calldata_bytes: 16_384,
+            symbolic_call_targets: true,
+            dump_smt: true,
+            ..Default::default()
+        };
+
+        let managed = managed_hybrid_symbolic_config(&config);
+
+        assert!(managed.enabled);
+        assert!(!managed.seed_corpus);
+        assert!(!managed.use_fuzz_corpus);
+        assert!(!managed.use_fuzz_frontiers);
+        assert_eq!(managed.timeout, Some(HYBRID_SYMBOLIC_TIMEOUT_SECS));
+        assert_eq!(managed.max_paths, HYBRID_SYMBOLIC_MAX_PATHS);
+        assert_eq!(managed.width, None);
+        assert_eq!(managed.path_width(), HYBRID_SYMBOLIC_MAX_PATHS);
+        assert_eq!(managed.max_solver_queries, HYBRID_SYMBOLIC_MAX_QUERIES);
+        assert_eq!(managed.default_dynamic_length, HYBRID_SYMBOLIC_MAX_DYNAMIC_LENGTH);
+        assert_eq!(managed.max_dynamic_length, HYBRID_SYMBOLIC_MAX_DYNAMIC_LENGTH);
+        assert_eq!(managed.array_lengths, vec![4, HYBRID_SYMBOLIC_MAX_DYNAMIC_LENGTH]);
+        assert_eq!(
+            managed.dynamic_lengths.get("arg"),
+            Some(&vec![2, HYBRID_SYMBOLIC_MAX_DYNAMIC_LENGTH])
+        );
+        assert_eq!(managed.default_array_lengths, vec![3, HYBRID_SYMBOLIC_MAX_DYNAMIC_LENGTH]);
+        assert_eq!(managed.default_bytes_lengths, vec![5, HYBRID_SYMBOLIC_MAX_DYNAMIC_LENGTH]);
+        assert_eq!(managed.max_calldata_bytes, HYBRID_SYMBOLIC_MAX_CALLDATA_BYTES);
+        assert!(!managed.symbolic_call_targets);
+        assert!(managed.solver_command.is_none());
+        assert!(managed.solver_portfolio.is_empty());
+        assert!(!managed.dump_smt);
+
+        let stricter = SymbolicConfig {
+            timeout: Some(1),
+            max_paths: 64,
+            max_solver_queries: 256,
+            ..Default::default()
+        };
+        let managed = managed_hybrid_symbolic_config(&stricter);
+
+        assert_eq!(managed.timeout, Some(1));
+        assert_eq!(managed.max_paths, 64);
+        assert_eq!(managed.max_solver_queries, 256);
+
+        let unbounded = SymbolicConfig { timeout: Some(0), ..Default::default() };
+        let managed = managed_hybrid_symbolic_config(&unbounded);
+        assert_eq!(managed.timeout, Some(HYBRID_SYMBOLIC_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn managed_hybrid_maps_incomplete_kinds() {
+        assert_eq!(
+            hybrid_incomplete_kind(SymbolicStopReason::Stuck),
+            HybridFuzzIncompleteKind::Stuck
+        );
+        assert_eq!(
+            hybrid_incomplete_kind(SymbolicStopReason::RevertAll),
+            HybridFuzzIncompleteKind::RevertAll
+        );
+        assert_eq!(
+            hybrid_incomplete_kind(SymbolicStopReason::Timeout),
+            HybridFuzzIncompleteKind::Timeout
+        );
+        assert_eq!(
+            hybrid_incomplete_kind(SymbolicStopReason::Error),
+            HybridFuzzIncompleteKind::Error
+        );
     }
 
     #[test]
@@ -3082,7 +3233,10 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             });
 
             let (input, expect_failure) = match result {
-                SymbolicRunResult::Safe { success_input: Some(input), .. } => (input, false),
+                // Targeted frontier runs may return as soon as the branch is flipped. Concrete
+                // replay decides whether the candidate is a passing cold-path seed or a real
+                // fuzz failure.
+                SymbolicRunResult::Safe { success_input: Some(input), .. } => (input, None),
                 SymbolicRunResult::Safe { success_input: None, .. } => {
                     warn!(
                         id,
@@ -3102,14 +3256,16 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                     continue;
                 }
                 SymbolicRunResult::Counterexample { args, calldata, .. } => {
-                    (SymbolicConcreteInput { args, calldata }, true)
+                    (SymbolicConcreteInput { args, calldata }, Some(true))
                 }
             };
 
-            let replay = self.symbolic_fuzz_seed_replay(sender, &input, fuzz_config);
+            let replay = self.symbolic_fuzz_seed_replay(sender, &input, fuzz_config, Some(target));
             let replay_matches = matches!(
                 (expect_failure, replay),
-                (false, SymbolicFuzzSeedReplay::Success) | (true, SymbolicFuzzSeedReplay::Failure)
+                (Some(false), SymbolicFuzzSeedReplay::Success)
+                    | (Some(true), SymbolicFuzzSeedReplay::Failure)
+                    | (None, SymbolicFuzzSeedReplay::Success | SymbolicFuzzSeedReplay::Failure)
             );
             if !replay_matches {
                 warn!(
@@ -3151,6 +3307,62 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                 }
             }
         }
+    }
+
+    fn managed_hybrid_fuzz_assist(&self, func: &Function) -> Option<HybridFuzzAssist<FEN>> {
+        if !self.tcfg.hybrid_fuzz {
+            return None;
+        }
+
+        let config = managed_hybrid_symbolic_config(&self.config.symbolic);
+        let function = func.clone();
+        let target_address = self.address;
+        let sender = self.sender;
+        let solver = move |executor: &Executor<FEN>, target: HybridFuzzTarget| {
+            let calldata = target.calldata().clone();
+            let Some(encoded_args) = calldata.get(4..) else {
+                return HybridFuzzSolve::Incomplete(HybridFuzzIncompleteKind::Error);
+            };
+            let Ok(args) = function.abi_decode_input(encoded_args) else {
+                return HybridFuzzSolve::Incomplete(HybridFuzzIncompleteKind::Error);
+            };
+            let seed = SymbolicConcreteInput { args, calldata };
+            let branch_target = SymbolicBranchTarget::new(
+                target.address(),
+                target.pc(),
+                target.opcode(),
+                target.observed_result(),
+            );
+            let mut symbolic = SymbolicExecutor::new(config.clone());
+            let result = symbolic.run(SymbolicRunInput {
+                executor,
+                target: target_address,
+                sender,
+                function: &function,
+                value: U256::ZERO,
+                // Managed campaigns never execute subprocesses from solver-generated inputs.
+                ffi_enabled: false,
+                collect_success_input: true,
+                corpus_seeds: vec![seed],
+                branch_target: Some(branch_target),
+            });
+
+            match result {
+                SymbolicRunResult::Safe { success_input: Some(input), .. } => {
+                    HybridFuzzSolve::Candidate(input.calldata)
+                }
+                SymbolicRunResult::Counterexample { calldata, .. } => {
+                    HybridFuzzSolve::Candidate(calldata)
+                }
+                SymbolicRunResult::Safe { success_input: None, .. } => {
+                    HybridFuzzSolve::Incomplete(HybridFuzzIncompleteKind::NoInput)
+                }
+                SymbolicRunResult::Incomplete { kind, .. } => {
+                    HybridFuzzSolve::Incomplete(hybrid_incomplete_kind(kind))
+                }
+            }
+        };
+        Some(HybridFuzzAssist::new(Arc::new(solver)))
     }
 
     fn try_seed_fuzz_corpus_symbolically(&self, func: &Function, fuzz_config: &FuzzConfig) {
@@ -3222,7 +3434,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         input: &SymbolicConcreteInput,
         fuzz_config: &FuzzConfig,
     ) -> bool {
-        self.symbolic_fuzz_seed_replay(sender, input, fuzz_config)
+        self.symbolic_fuzz_seed_replay(sender, input, fuzz_config, None)
             == SymbolicFuzzSeedReplay::Success
     }
 
@@ -3231,17 +3443,29 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         sender: Address,
         input: &SymbolicConcreteInput,
         fuzz_config: &FuzzConfig,
+        branch_target: Option<SymbolicBranchTarget>,
     ) -> SymbolicFuzzSeedReplay {
-        let Ok(raw_call_result) = self.clone_executor().call_raw(
-            sender,
-            self.address,
-            input.calldata.clone(),
-            U256::ZERO,
-        ) else {
+        let mut executor = self.clone_executor();
+        executor.inspector_mut().collect_evm_cmp_log(branch_target.is_some());
+        let Ok(raw_call_result) =
+            executor.call_raw(sender, self.address, input.calldata.clone(), U256::ZERO)
+        else {
             return SymbolicFuzzSeedReplay::Rejected;
         };
 
         if raw_call_result.result.as_ref() == MAGIC_ASSUME {
+            return SymbolicFuzzSeedReplay::Rejected;
+        }
+        if let Some(target) = branch_target
+            && !raw_call_result.evm_cmp_values.as_deref().is_some_and(|comparisons| {
+                comparisons.iter().any(|comparison| {
+                    comparison.address == target.address()
+                        && comparison.pc == target.pc()
+                        && comparison.opcode == target.opcode()
+                        && comparison.result() != target.observed_result()
+                })
+            })
+        {
             return SymbolicFuzzSeedReplay::Rejected;
         }
 
@@ -4849,18 +5073,22 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         );
 
         let state = self.build_fuzz_state(false, Some(func));
+        let hybrid_assist = self.managed_hybrid_fuzz_assist(func);
         let mut executor = self.executor.into_owned();
         // Enable edge coverage if running with coverage guided fuzzing or with edge coverage
         // metrics (useful for benchmarking the fuzzer).
         executor.inspector_mut().collect_edge_coverage_with_config(&fuzz_config.corpus);
-        executor.inspector_mut().collect_evm_cmp_log(fuzz_config.corpus.collect_evm_cmp_log());
+        executor.inspector_mut().collect_evm_cmp_log(
+            fuzz_config.corpus.collect_evm_cmp_log() || hybrid_assist.is_some(),
+        );
         executor.inspector_mut().collect_sancov_edges(fuzz_config.corpus.collect_sancov_edges());
         executor
             .inspector_mut()
             .collect_sancov_trace_cmp(fuzz_config.corpus.collect_sancov_trace_cmp());
         // Run fuzz test.
         let mut fuzzed_executor =
-            FuzzedExecutor::new(executor, runner, self.tcfg.sender, fuzz_config, persisted_failure);
+            FuzzedExecutor::new(executor, runner, self.tcfg.sender, fuzz_config, persisted_failure)
+                .with_hybrid_assist(hybrid_assist);
         if self.cr.mcr.tcfg.fuzz_failure_replay {
             let result = match fuzzed_executor.replay_persisted_failure(
                 func,

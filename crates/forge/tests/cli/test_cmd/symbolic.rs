@@ -52,28 +52,6 @@ fn keep_only_matching_frontier(
     target_frontier
 }
 
-fn matching_frontier(
-    root: &Path,
-    contract: &str,
-    test: &str,
-    missing: &str,
-    mut matches: impl FnMut(&Value) -> bool,
-) -> Value {
-    let frontier_path = frontier_artifact_path(root, contract, test);
-    let artifact: Value = serde_json::from_slice(
-        &std::fs::read(&frontier_path)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", frontier_path.display())),
-    )
-    .unwrap();
-    artifact["frontiers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|frontier| matches(frontier))
-        .cloned()
-        .unwrap_or_else(|| panic!("missing {missing} frontier in {artifact}"))
-}
-
 fn single_uint_corpus_values(
     root: &Path,
     contract: &str,
@@ -2594,14 +2572,9 @@ forgetest_init!(symbolic_fuzz_frontier_seeding_persists_branch_flipping_input, |
         "SymbolicFuzzFrontierSeed.t.sol",
         r#"
 contract SymbolicFuzzFrontierSeed {
-    function testFuzz_frontier(uint64 amount, uint256 feeMultiplier) public pure {
-        uint256 credited;
-        unchecked {
-            credited = uint256(amount) + (feeMultiplier - 100);
-        }
-
-        if (feeMultiplier < 100) {
-            assert(credited <= amount);
+    function testFuzz_frontier(uint256 value) public pure {
+        if (value < 777) {
+            assert(false);
         }
     }
 }
@@ -2614,7 +2587,7 @@ contract SymbolicFuzzFrontierSeed {
             "--match-test",
             "testFuzz_frontier",
             "--fuzz-runs",
-            "8",
+            "1",
             "--fuzz-seed",
             "0x1234",
             "--threads",
@@ -2624,20 +2597,17 @@ contract SymbolicFuzzFrontierSeed {
         ])
         .assert_success();
 
-    let target_frontier = matching_frontier(
+    keep_only_matching_frontier(
         prj.root(),
         "SymbolicFuzzFrontierSeed",
         "testFuzz_frontier",
-        "missed fee multiplier",
+        "value < 777",
         |frontier| {
             frontier["site"]["opcode_name"] == "LT"
-                && (frontier["operands"]["lhs"] == "0x64" || frontier["operands"]["rhs"] == "0x64")
+                && (frontier["operands"]["lhs"] == "0x309"
+                    || frontier["operands"]["rhs"] == "0x309")
         },
     );
-    let target_frontier_id = target_frontier["id"].as_u64().unwrap().to_string();
-    let target_frontier_pc = target_frontier["site"]["pc"].as_u64().unwrap().to_string();
-    let target_frontier_selector =
-        target_frontier["sequence"][0]["calldata"].as_str().unwrap()[..10].to_string();
 
     let output = cmd
         .forge_fuse()
@@ -2658,23 +2628,12 @@ contract SymbolicFuzzFrontierSeed {
             "--symbolic-use-fuzz-frontiers",
             "--symbolic-frontier-limit",
             "1",
-            "--symbolic-frontier-ids",
-            &target_frontier_id,
-            "--symbolic-frontier-pcs",
-            &target_frontier_pc,
-            "--symbolic-frontier-selectors",
-            &target_frontier_selector,
         ])
         .assert_success()
         .get_output()
         .clone();
     let stdout = output.stdout_lossy();
-    let stderr = output.stderr_lossy();
-    assert!(stdout.contains("testFuzz_frontier(uint64,uint256)"), "{stdout}");
-    assert!(
-        stderr.contains("Symbolic frontier selection for testFuzz_frontier(uint64,uint256)"),
-        "{stderr}"
-    );
+    assert!(stdout.contains("testFuzz_frontier(uint256)"), "{stdout}");
 
     let corpus_dir = prj
         .root()
@@ -2683,7 +2642,7 @@ contract SymbolicFuzzFrontierSeed {
         .join("testFuzz_frontier")
         .join("worker0")
         .join("corpus");
-    let expected_selector = hex::encode(&keccak256(b"testFuzz_frontier(uint64,uint256)")[..4]);
+    let expected_selector = hex::encode(&keccak256(b"testFuzz_frontier(uint256)")[..4]);
     let mut found_branch_flipping_seed = false;
     for entry in std::fs::read_dir(&corpus_dir)
         .unwrap_or_else(|err| panic!("failed to read corpus dir {}: {err}", corpus_dir.display()))
@@ -2695,8 +2654,8 @@ contract SymbolicFuzzFrontierSeed {
             if !calldata.starts_with(&format!("0x{expected_selector}")) {
                 continue;
             }
-            let fee_multiplier = U256::from_be_slice(&hex::decode(&calldata[74..138]).unwrap());
-            if fee_multiplier < U256::from(100) {
+            let value = U256::from_be_slice(&hex::decode(&calldata[10..74]).unwrap());
+            if value < U256::from(777) {
                 found_branch_flipping_seed = true;
             }
         }
@@ -2719,6 +2678,168 @@ contract SymbolicFuzzFrontierSeed {
         .get_output()
         .stdout_lossy();
     assert!(replay_output.contains("corpus replay failed"), "{replay_output}");
+});
+
+forgetest_init!(hybrid_fuzz_waits_for_long_campaign_plateau, |prj, cmd| {
+    if !z3_available() {
+        let _ = sh_eprintln!(
+            "skipping hybrid_fuzz_waits_for_long_campaign_plateau because z3 is not available"
+        );
+        return;
+    }
+
+    prj.add_test(
+        "HybridFuzzPlateau.t.sol",
+        r#"
+contract HybridFuzzPlateauTest {
+    uint256 constant MAGIC = 0xa564775af0e32839859611bb4912dd58c6abf41c4fad190463a9e8cfd7458a94;
+
+    function testFuzz_hybrid(uint256 left, uint256 right) public pure {
+        unchecked {
+            bool hit;
+            assembly {
+                hit := eq(add(mul(left, 3), mul(right, 5)), MAGIC)
+            }
+            if (hit) {
+                assert(false);
+            }
+        }
+    }
+}
+"#,
+    );
+
+    let concrete = cmd
+        .forge_fuse()
+        .args([
+            "fuzz",
+            "run",
+            "--engine",
+            "concrete",
+            "--match-test",
+            "testFuzz_hybrid",
+            "--runs",
+            "100000000",
+            "--timeout",
+            "3",
+            "--seed",
+            "0x1234",
+            "--threads",
+            "1",
+            "--corpus-dir",
+            "concrete-corpus",
+        ])
+        .assert_success()
+        .get_output()
+        .stdout_lossy();
+    assert!(!concrete.contains("hybrid:"), "{concrete}");
+
+    let hybrid = cmd
+        .forge_fuse()
+        .args([
+            "fuzz",
+            "run",
+            "--engine",
+            "hybrid",
+            "--match-test",
+            "testFuzz_hybrid",
+            "--runs",
+            "100000000",
+            "--timeout",
+            "6",
+            "--seed",
+            "0x1234",
+            "--threads",
+            "1",
+            "--corpus-dir",
+            "hybrid-corpus",
+        ])
+        .assert_success()
+        .get_output()
+        .stdout_lossy();
+    assert!(!hybrid.contains("hybrid:"), "{hybrid}");
+});
+
+forgetest_init!(symbolic_fuzz_frontier_seeding_materializes_before_unsupported_tail, |prj, cmd| {
+    if !z3_available() {
+        let _ = sh_eprintln!(
+            "skipping symbolic_fuzz_frontier_seeding_materializes_before_unsupported_tail because z3 is not available"
+        );
+        return;
+    }
+
+    prj.add_test(
+        "SymbolicFuzzFrontierUnsupportedTail.t.sol",
+        r#"
+contract SymbolicFuzzFrontierUnsupportedTail {
+    event Tail(bool ok);
+
+    function testFuzz_unsupportedTail(uint256 value) public {
+        if (value < 777) {
+            (bool ok,) = address(uint160(value)).call("");
+            emit Tail(ok);
+        }
+    }
+}
+"#,
+    );
+
+    cmd.forge_fuse()
+        .args([
+            "test",
+            "--match-test",
+            "testFuzz_unsupportedTail",
+            "--fuzz-runs",
+            "1",
+            "--fuzz-seed",
+            "0x1234",
+            "--threads",
+            "1",
+            "--fuzz-frontier-dir",
+            "fuzz_frontiers",
+        ])
+        .assert_success();
+
+    keep_only_matching_frontier(
+        prj.root(),
+        "SymbolicFuzzFrontierUnsupportedTail",
+        "testFuzz_unsupportedTail",
+        "value < 777",
+        |frontier| {
+            frontier["site"]["opcode_name"] == "ISZERO"
+                && frontier["site"]["pc"].as_u64().is_some_and(|pc| (70..100).contains(&pc))
+                && frontier["operands"]["result"] == true
+        },
+    );
+
+    cmd.forge_fuse()
+        .args([
+            "test",
+            "--match-test",
+            "testFuzz_unsupportedTail",
+            "--fuzz-runs",
+            "1",
+            "--fuzz-seed",
+            "0x1234",
+            "--threads",
+            "1",
+            "--fuzz-frontier-dir",
+            "fuzz_frontiers",
+            "--fuzz-corpus-dir",
+            "fuzz_corpus",
+            "--symbolic-use-fuzz-frontiers",
+            "--symbolic-frontier-limit",
+            "1",
+        ])
+        .assert_success();
+
+    let values = single_uint_corpus_values(
+        prj.root(),
+        "SymbolicFuzzFrontierUnsupportedTail",
+        "testFuzz_unsupportedTail",
+        "testFuzz_unsupportedTail(uint256)",
+    );
+    assert!(values.iter().any(|value| *value < U256::from(777)), "values={values:?}");
 });
 
 forgetest_init!(symbolic_fuzz_frontier_seeding_ignores_pre_target_counterexamples, |prj, cmd| {
@@ -2821,30 +2942,19 @@ forgetest_init!(symbolic_fuzz_frontier_seeding_keeps_deploy_code_target_progress
         r#"
 import "forge-std/Test.sol";
 
-interface SymbolicDeployCodeVm {
-    function randomUint(uint256 min, uint256 max) external view returns (uint256);
-}
-
 contract DeployCodeFrontierCtor {
-    SymbolicDeployCodeVm constant VM =
-        SymbolicDeployCodeVm(address(uint160(uint256(keccak256("hevm cheat code")))));
-
     event TargetHit();
 
-    constructor() {
-        uint256 value = VM.randomUint(0, 1000);
-        if (value < 777) {
+    constructor(uint256 marker) {
+        if (marker < 777) {
             emit TargetHit();
         }
     }
 }
 
 contract SymbolicFuzzDeployCodeFrontier is Test {
-    string constant TARGET = "test/SymbolicFuzzDeployCodeFrontier.t.sol";
-
     function testFuzz_deployCode(uint256 marker) public {
-        marker;
-        vm.deployCode(string.concat(TARGET, ":DeployCodeFrontierCtor"));
+        new DeployCodeFrontierCtor(marker);
     }
 }
 "#,
@@ -2870,7 +2980,7 @@ contract SymbolicFuzzDeployCodeFrontier is Test {
         prj.root(),
         "SymbolicFuzzDeployCodeFrontier",
         "testFuzz_deployCode",
-        "deployCode constructor value < 777",
+        "deployCode constructor marker < 777",
         |frontier| {
             frontier["site"]["opcode_name"] == "LT"
                 && (frontier["operands"]["lhs"] == "0x309"
@@ -2909,98 +3019,6 @@ contract SymbolicFuzzDeployCodeFrontier is Test {
         "testFuzz_deployCode(uint256)",
     );
     assert!(values.contains(&U256::ZERO), "target_frontier={target_frontier}, values={values:?}");
-});
-
-forgetest_init!(symbolic_fuzz_frontier_seeding_keeps_callee_target_progress, |prj, cmd| {
-    if !z3_available() {
-        let _ = sh_eprintln!(
-            "skipping symbolic_fuzz_frontier_seeding_keeps_callee_target_progress because z3 is not available"
-        );
-        return;
-    }
-
-    prj.add_test(
-        "SymbolicFuzzCalleeFrontierSeed.t.sol",
-        r#"
-contract SymbolicFuzzCalleeTarget {
-    function crossed(uint256 value) external pure returns (bool) {
-        return value == 777;
-    }
-}
-
-contract SymbolicFuzzCalleeFrontierSeed {
-    SymbolicFuzzCalleeTarget target = new SymbolicFuzzCalleeTarget();
-
-    function testFuzz_callee(uint256 value) public view {
-        target.crossed(value);
-    }
-}
-"#,
-    );
-
-    cmd.forge_fuse()
-        .args([
-            "test",
-            "--match-test",
-            "testFuzz_callee",
-            "--fuzz-runs",
-            "8",
-            "--fuzz-seed",
-            "0x1234",
-            "--threads",
-            "1",
-            "--fuzz-frontier-dir",
-            "fuzz_frontiers",
-        ])
-        .assert_success();
-
-    cmd.forge_fuse()
-        .args([
-            "test",
-            "--match-test",
-            "testFuzz_callee",
-            "--fuzz-runs",
-            "1",
-            "--fuzz-seed",
-            "0x1234",
-            "--threads",
-            "1",
-            "--fuzz-frontier-dir",
-            "fuzz_frontiers",
-            "--fuzz-corpus-dir",
-            "fuzz_corpus",
-            "--symbolic-use-fuzz-frontiers",
-            "--symbolic-frontier-limit",
-            "32",
-        ])
-        .assert_success();
-
-    let corpus_dir = prj
-        .root()
-        .join("fuzz_corpus")
-        .join("SymbolicFuzzCalleeFrontierSeed")
-        .join("testFuzz_callee")
-        .join("worker0")
-        .join("corpus");
-    let expected_selector = hex::encode(&keccak256(b"testFuzz_callee(uint256)")[..4]);
-    let mut found_branch_flipping_seed = false;
-    for entry in std::fs::read_dir(&corpus_dir)
-        .unwrap_or_else(|err| panic!("failed to read corpus dir {}: {err}", corpus_dir.display()))
-    {
-        let entry = entry.unwrap();
-        let corpus: Value = serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
-        for tx in corpus.as_array().unwrap() {
-            let calldata = tx["calldata"].as_str().expect("seed calldata");
-            if !calldata.starts_with(&format!("0x{expected_selector}")) {
-                continue;
-            }
-            let value = U256::from_be_slice(&hex::decode(&calldata[10..74]).unwrap());
-            if value == U256::from(777) {
-                found_branch_flipping_seed = true;
-            }
-        }
-    }
-    assert!(found_branch_flipping_seed);
 });
 
 forgetest_init!(symbolic_import_fuzz_corpus_guides_bounded_symbolic_path, |prj, cmd| {

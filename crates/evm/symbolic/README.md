@@ -181,6 +181,53 @@ after filtering, imports up to `symbolic.frontier_limit` records, reports how
 many records were imported or skipped by target filters, and warns if a
 requested target cannot be imported.
 
+## Managed Hybrid Fuzz Campaigns
+
+`forge fuzz run --engine hybrid` keeps the normal concrete fuzz campaign in
+charge and uses symbolic execution only as a bounded assist after concrete
+coverage has warmed up over millions of fast runs, or after a long wall-clock
+plateau on slower real-protocol tests, and stopped finding new edges for
+minutes. The assist reuses one existing fuzz worker, targets a retained
+input-dependent comparison frontier that concrete fuzzing has not already
+flipped, and replays solver-produced calldata through the normal fuzzer before
+reporting or adding it to the live corpus.
+
+Use hybrid mode for long-running stateless, one-call fuzz tests whose hard
+branch is visible as an EVM comparison in the fuzz entrypoint, for example
+arithmetic guards, threshold checks, and derived DeFi predicates that random
+mutation rarely satisfies after millions of concrete runs. Prefer the default
+concrete engine for invariant campaigns, nested-call targeting, fork-heavy tests,
+cryptographic preimage conditions, and tests whose bottleneck is not a narrow
+calldata branch.
+
+A controlled long-campaign benchmark has demonstrated the narrower intended
+use case: after a checksum-like arithmetic guard remained cold for more than 10
+million concrete executions and a 15-minute no-new-edge plateau, one bounded
+assist produced a replay-confirmed counterexample for a downstream Nomad
+zero-root assertion. A same-seed concrete-only control remained passing through
+its longer 920-second cutoff. This single adapter benchmark does not establish
+broad time-to-bug or coverage gains on invariant-heavy or nonlinear DeFi
+workloads, so hybrid mode remains opt-in and experimental. It can also be used
+to try automated cold-path corpus generation before offline replay or
+differential coverage experiments: run the normal concrete campaign, let the
+managed assist inject any replay-confirmed branch-flipping calldata into the
+corpus, then replay that corpus with `forge test --showmap-out` or under the
+alternate toolchain. It does not compare toolchains or prove semantic
+equivalence by itself.
+
+Each campaign starts with concrete fuzzing and permits at most one symbolic
+assist process-wide at a time. A fuzz test may try a small ranked burst of
+retained frontiers per long no-progress window, with cooldown and backoff after
+assists so unsolved targets do not consume the whole campaign. The managed
+assist returns as soon as it materializes a branch-flipping input, uses smaller
+symbolic bounds than an explicit `forge test --symbolic` run, and replays each
+candidate through the normal concrete fuzzer. A replay that expands edge
+coverage follows the normal corpus path. Without new coverage, a passing input
+is preserved only when concrete replay observes the opposite comparison result
+at the targeted address, PC, and opcode. Hybrid mode records counters for
+attempts, solver candidates, incomplete assists, coverage-useful candidates,
+corpus-preserved candidates, and replayed counterexamples.
+
 > **Hash-model caveat:** `PASS` also assumes collision and preimage resistance
 > for symbolic `KECCAK256` and hash-like precompile terms. The executor may use
 > equal symbolic hashes to infer equal symbolic preimages or lengths in modeled

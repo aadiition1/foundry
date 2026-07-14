@@ -1479,6 +1479,26 @@ impl WorkerCorpus {
         tx_seq: Vec<BasicTxDetails>,
         insertion_mode: CorpusInsertionMode,
     ) -> Option<CampaignCorpusEntry> {
+        self.push_replayed_sequence_inner(tx_seq, insertion_mode)
+    }
+
+    /// Preserves a replay-confirmed sequence that should participate in later corpus mutation or
+    /// offline replay even when this worker's edge map does not classify it as new coverage.
+    pub(crate) fn push_replayed_sequence(
+        &mut self,
+        tx_seq: Vec<BasicTxDetails>,
+        insertion_mode: CorpusInsertionMode,
+    ) -> bool {
+        let len_before = self.in_memory_corpus.len();
+        let _ = self.push_replayed_sequence_inner(tx_seq, insertion_mode);
+        self.in_memory_corpus.len() > len_before
+    }
+
+    fn push_replayed_sequence_inner(
+        &mut self,
+        tx_seq: Vec<BasicTxDetails>,
+        insertion_mode: CorpusInsertionMode,
+    ) -> Option<CampaignCorpusEntry> {
         if !self.config.is_coverage_guided() || tx_seq.is_empty() {
             return None;
         }
@@ -3045,6 +3065,21 @@ mod tests {
         );
         assert_eq!(manager.in_memory_corpus.len(), 1);
         assert_eq!(read_corpus_dir(&worker1_corpus_dir).count(), 0);
+    }
+
+    #[test]
+    fn push_replayed_sequence_reports_live_insertions() {
+        let corpus_root = temp_corpus_dir();
+        let worker0_corpus_dir = corpus_root.join("worker0").join(CORPUS_DIR);
+        let mut manager = empty_worker_corpus(0, corpus_root);
+
+        assert!(manager.push_replayed_sequence(vec![basic_tx()], CorpusInsertionMode::Live));
+        assert_eq!(manager.in_memory_corpus.len(), 1);
+        assert_eq!(read_corpus_dir(&worker0_corpus_dir).count(), 1);
+        assert!(
+            !manager.push_replayed_sequence(Vec::new(), CorpusInsertionMode::Live),
+            "empty replay sequences should not be inserted"
+        );
     }
 
     #[test]

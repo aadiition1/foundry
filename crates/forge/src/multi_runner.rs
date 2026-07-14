@@ -482,6 +482,8 @@ pub struct TestRunnerConfig<FEN: FoundryEvmNetwork> {
     pub fuzz_only: bool,
     /// Replay persisted fuzz failures without running a new fuzz campaign.
     pub fuzz_failure_replay: bool,
+    /// Whether stateless fuzz campaigns may request managed symbolic assistance.
+    pub hybrid_fuzz: bool,
 
     /// When set, run only the matching test and replay this artifact's concrete payload.
     pub symbolic_artifact_replay: Option<SymbolicArtifactReplayConfig>,
@@ -617,6 +619,8 @@ pub struct MultiContractRunnerBuilder {
     pub fuzz_only: bool,
     /// Replay persisted fuzz failures without running a new fuzz campaign.
     pub fuzz_failure_replay: bool,
+    /// Enable managed symbolic assistance for stateless fuzz campaigns.
+    pub hybrid_fuzz: bool,
     /// Symbolic artifact replay mode (CLI-only, off by default).
     pub symbolic_artifact_replay: Option<SymbolicArtifactReplayConfig>,
 }
@@ -640,6 +644,7 @@ impl MultiContractRunnerBuilder {
             fuzz_minimize: None,
             fuzz_only: false,
             fuzz_failure_replay: false,
+            hybrid_fuzz: false,
             symbolic_artifact_replay: None,
         }
     }
@@ -661,6 +666,11 @@ impl MultiContractRunnerBuilder {
 
     pub const fn with_fuzz_failure_replay(mut self, fuzz_failure_replay: bool) -> Self {
         self.fuzz_failure_replay = fuzz_failure_replay;
+        self
+    }
+
+    pub const fn with_hybrid_fuzz(mut self, hybrid_fuzz: bool) -> Self {
+        self.hybrid_fuzz = hybrid_fuzz;
         self
     }
 
@@ -864,6 +874,7 @@ impl MultiContractRunnerBuilder {
                 fuzz_minimize: self.fuzz_minimize,
                 fuzz_only: self.fuzz_only,
                 fuzz_failure_replay: self.fuzz_failure_replay,
+                hybrid_fuzz: self.hybrid_fuzz,
                 symbolic_artifact_replay: self.symbolic_artifact_replay,
                 config: self.config,
             },

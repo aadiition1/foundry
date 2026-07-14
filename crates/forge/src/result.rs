@@ -17,7 +17,7 @@ use foundry_evm::{
     decode::SkipReason,
     executors::{RawCallResult, invariant::InvariantMetrics},
     fuzz::{
-        CallDetails, CounterExample, FuzzCase, FuzzFixtures, FuzzTestResult,
+        CallDetails, CounterExample, FuzzCase, FuzzFixtures, FuzzTestResult, HybridFuzzStats,
         strategies::EvmFuzzState,
     },
     traces::{CallTraceArena, CallTraceDecoder, TraceKind, Traces},
@@ -2353,6 +2353,7 @@ impl TestResult {
             first_case: result.first_case,
             runs: result.gas_by_case.len(),
             failed_corpus_replays: result.failed_corpus_replays,
+            hybrid: result.hybrid,
         };
 
         // Record logs, labels, traces and merge coverages.
@@ -2381,6 +2382,7 @@ impl TestResult {
             mean_gas: 0,
             median_gas: 0,
             failed_corpus_replays: 0,
+            hybrid: HybridFuzzStats::default(),
         };
         self.status = TestStatus::Failure;
         debug!(?e, "failed to set up fuzz testing environment");
@@ -2717,6 +2719,7 @@ pub enum TestKindReport {
         mean_gas: u64,
         median_gas: u64,
         failed_corpus_replays: usize,
+        hybrid: HybridFuzzStats,
     },
     Invariant {
         runs: usize,
@@ -2755,14 +2758,57 @@ pub enum TestKindReport {
     },
 }
 
+fn hybrid_incomplete_breakdown(hybrid: &HybridFuzzStats) -> Option<String> {
+    if hybrid.incomplete == 0 {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if hybrid.incomplete_timeout != 0 {
+        parts.push(format!("{} timeout", hybrid.incomplete_timeout));
+    }
+    if hybrid.incomplete_stuck != 0 {
+        parts.push(format!("{} stuck", hybrid.incomplete_stuck));
+    }
+    if hybrid.incomplete_revert_all != 0 {
+        parts.push(format!("{} revert_all", hybrid.incomplete_revert_all));
+    }
+    if hybrid.incomplete_no_input != 0 {
+        parts.push(format!("{} no_input", hybrid.incomplete_no_input));
+    }
+    if hybrid.incomplete_error != 0 {
+        parts.push(format!("{} error", hybrid.incomplete_error));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
 impl fmt::Display for TestKindReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unit { gas } => {
                 write!(f, "(gas: {gas})")
             }
-            Self::Fuzz { runs, mean_gas, median_gas, failed_corpus_replays } => {
-                if *failed_corpus_replays != 0 {
+            Self::Fuzz { runs, mean_gas, median_gas, failed_corpus_replays, hybrid } => {
+                if !hybrid.is_empty() {
+                    let incomplete = if let Some(breakdown) = hybrid_incomplete_breakdown(hybrid) {
+                        format!("{} incomplete ({breakdown})", hybrid.incomplete)
+                    } else {
+                        format!("{} incomplete", hybrid.incomplete)
+                    };
+                    let corpus = if hybrid.corpus_candidates != 0 {
+                        format!(", {} corpus", hybrid.corpus_candidates)
+                    } else {
+                        String::new()
+                    };
+                    write!(
+                        f,
+                        "(runs: {runs}, μ: {mean_gas}, ~: {median_gas}, hybrid: {} attempts, {} candidates, {incomplete}, {} useful{corpus}, {} counterexamples)",
+                        hybrid.attempts,
+                        hybrid.candidates,
+                        hybrid.useful_candidates,
+                        hybrid.counterexamples,
+                    )
+                } else if *failed_corpus_replays != 0 {
                     write!(
                         f,
                         "(runs: {runs}, μ: {mean_gas}, ~: {median_gas}, failed corpus replays: {failed_corpus_replays})"
@@ -2854,6 +2900,8 @@ pub enum TestKind {
         mean_gas: u64,
         median_gas: u64,
         failed_corpus_replays: usize,
+        #[serde(default, skip_serializing_if = "HybridFuzzStats::is_empty")]
+        hybrid: HybridFuzzStats,
     },
     /// An invariant test.
     Invariant {
@@ -2935,14 +2983,20 @@ impl TestKind {
     pub fn report(&self) -> TestKindReport {
         match self {
             Self::Unit { gas } => TestKindReport::Unit { gas: *gas },
-            Self::Fuzz { first_case: _, runs, mean_gas, median_gas, failed_corpus_replays } => {
-                TestKindReport::Fuzz {
-                    runs: *runs,
-                    mean_gas: *mean_gas,
-                    median_gas: *median_gas,
-                    failed_corpus_replays: *failed_corpus_replays,
-                }
-            }
+            Self::Fuzz {
+                first_case: _,
+                runs,
+                mean_gas,
+                median_gas,
+                failed_corpus_replays,
+                hybrid,
+            } => TestKindReport::Fuzz {
+                runs: *runs,
+                mean_gas: *mean_gas,
+                median_gas: *median_gas,
+                failed_corpus_replays: *failed_corpus_replays,
+                hybrid: *hybrid,
+            },
             Self::Invariant {
                 runs,
                 calls,

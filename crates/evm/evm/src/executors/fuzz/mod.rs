@@ -1,6 +1,8 @@
 use crate::executors::{
     DURATION_BETWEEN_METRICS_REPORT, EarlyExit, Executor, FuzzTestTimer, RawCallResult,
-    corpus::{GlobalCorpusMetrics, ReplayTarget, StatelessReplayTarget, WorkerCorpus},
+    corpus::{
+        CorpusInsertionMode, GlobalCorpusMetrics, ReplayTarget, StatelessReplayTarget, WorkerCorpus,
+    },
 };
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::Function;
@@ -20,7 +22,7 @@ use foundry_evm_core::{
 use foundry_evm_coverage::HitMaps;
 use foundry_evm_fuzz::{
     BaseCounterExample, BasicTxDetails, CallDetails, CounterExample, FuzzCase, FuzzError,
-    FuzzFixtures, FuzzRunMetadata, FuzzTestResult,
+    FuzzFixtures, FuzzRunMetadata, FuzzTestResult, HybridFuzzStats,
     strategies::{EvmFuzzState, fuzz_calldata, fuzz_calldata_from_state, fuzz_msg_value},
 };
 use foundry_evm_traces::SparsedTraceArena;
@@ -33,15 +35,18 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde_json::json;
 use std::{
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU32, Ordering},
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 mod frontier;
+mod hybrid;
 mod types;
 use frontier::{FuzzBranchFrontier, FuzzBranchFrontierArtifact, FuzzFrontierRecorder};
+use hybrid::{HybridAssistLease, HybridFuzzTargetKey};
+pub use hybrid::{HybridFuzzAssist, HybridFuzzSolve, HybridFuzzSolver, HybridFuzzTarget};
 pub use types::{CaseOutcome, CounterExampleOutcome, FuzzOutcome};
 
 /// Corpus syncs across workers every `SYNC_INTERVAL` runs.
@@ -88,6 +93,8 @@ struct WorkerState<FEN: FoundryEvmNetwork> {
     failed_corpus_replays: usize,
     /// Branch frontiers captured for symbolic follow-up.
     frontiers: Vec<FuzzBranchFrontier>,
+    /// Managed symbolic-assist telemetry for this worker.
+    hybrid: HybridFuzzStats,
 }
 
 impl<FEN: FoundryEvmNetwork> WorkerState<FEN> {
@@ -109,6 +116,7 @@ impl<FEN: FoundryEvmNetwork> WorkerState<FEN> {
             last_run_timestamp: 0,
             failed_corpus_replays: 0,
             frontiers: Vec::new(),
+            hybrid: HybridFuzzStats::default(),
         }
     }
 }
@@ -135,6 +143,16 @@ struct SharedFuzzState {
     global_early_exit: EarlyExit,
     /// Local fuzz early exit.
     local_early_exit: EarlyExit,
+    /// Number of managed symbolic assists started for this fuzz test.
+    hybrid_attempts: AtomicU32,
+    /// Symbolic targets already tried by this fuzz test.
+    hybrid_attempted_targets: Mutex<HashMap<HybridFuzzTargetKey, U256>>,
+    /// Earliest time this fuzz test may start another managed symbolic assist.
+    hybrid_next_attempt_at: Mutex<Instant>,
+    /// Last time any worker reported new coverage.
+    hybrid_last_global_edge_at: Mutex<Option<Instant>>,
+    /// Campaign start used until the first new edge establishes a plateau timer.
+    started_at: Instant,
 }
 
 impl SharedFuzzState {
@@ -148,6 +166,11 @@ impl SharedFuzzState {
             global_corpus_metrics: GlobalCorpusMetrics::default(),
             global_early_exit: early_exit,
             local_early_exit: EarlyExit::new(true),
+            hybrid_attempts: AtomicU32::new(0),
+            hybrid_attempted_targets: Mutex::new(HashMap::default()),
+            hybrid_next_attempt_at: Mutex::new(Instant::now()),
+            hybrid_last_global_edge_at: Mutex::new(None),
+            started_at: Instant::now(),
         }
     }
 
@@ -159,6 +182,47 @@ impl SharedFuzzState {
     /// Increments and returns the new value of the number of rejected tests.
     fn increment_rejects(&self) -> u32 {
         self.total_rejects.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn try_start_hybrid_attempt(&self, max_attempts: u32) -> Option<u32> {
+        let mut attempts = self.hybrid_attempts.load(Ordering::Acquire);
+        loop {
+            if attempts >= max_attempts {
+                return None;
+            }
+            match self.hybrid_attempts.compare_exchange_weak(
+                attempts,
+                attempts + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(attempts + 1),
+                Err(next) => attempts = next,
+            }
+        }
+    }
+
+    fn hybrid_cooldown_elapsed(&self) -> bool {
+        Instant::now()
+            >= *self.hybrid_next_attempt_at.lock().expect("hybrid cooldown timer poisoned")
+    }
+
+    fn delay_next_hybrid_attempt(&self, delay: Duration) {
+        *self.hybrid_next_attempt_at.lock().expect("hybrid cooldown timer poisoned") =
+            Instant::now() + delay;
+    }
+
+    fn record_hybrid_global_edge(&self) {
+        *self.hybrid_last_global_edge_at.lock().expect("hybrid global edge timer poisoned") =
+            Some(Instant::now());
+    }
+
+    fn time_since_hybrid_global_edge(&self) -> Duration {
+        self.hybrid_last_global_edge_at
+            .lock()
+            .expect("hybrid global edge timer poisoned")
+            .map(|last_edge| last_edge.elapsed())
+            .unwrap_or_else(|| self.started_at.elapsed())
     }
 
     /// Returns `true` if the worker should continue running.
@@ -199,6 +263,8 @@ pub struct FuzzedExecutor<FEN: FoundryEvmNetwork> {
     persisted_failure: Option<BaseCounterExample>,
     /// The number of parallel workers.
     num_workers: usize,
+    /// Optional managed symbolic assistant for long-running fuzz campaigns.
+    hybrid_assist: Option<HybridFuzzAssist<FEN>>,
 }
 
 impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
@@ -219,7 +285,21 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             Ord::max(1, run_limit / MIN_RUNS_PER_WORKER)
         };
         let num_workers = Ord::min(rayon::current_num_threads(), max_workers as usize);
-        Self { executor_f: executor, runner, sender, config, persisted_failure, num_workers }
+        Self {
+            executor_f: executor,
+            runner,
+            sender,
+            config,
+            persisted_failure,
+            num_workers,
+            hybrid_assist: None,
+        }
+    }
+
+    /// Enables one bounded symbolic assist after concrete coverage stalls.
+    pub fn with_hybrid_assist(mut self, assist: Option<HybridFuzzAssist<FEN>>) -> Self {
+        self.hybrid_assist = assist;
+        self
     }
 
     /// Fuzzes the provided function, assuming it is available at the contract at `address`
@@ -438,6 +518,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                 traces: call.traces,
                 debug_bytecodes: call.debug_bytecodes,
                 coverage: call.line_coverage,
+                new_coverage,
                 breakpoints,
                 logs: call.logs,
                 deprecated_cheatcodes,
@@ -538,6 +619,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         }
 
         for mut worker in workers {
+            result.hybrid.merge(worker.hybrid);
             result.gas_by_case.append(&mut worker.gas_by_case);
             if self.config.show_logs {
                 result.logs.append(&mut worker.logs);
@@ -626,7 +708,14 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             replay_target,
         )?;
         let mut executor = self.executor_f.clone();
-        let frontier_limit = if self.config.corpus.capture_branch_frontiers() {
+        let frontier_limit = if let Some(assist) = self.hybrid_assist.as_ref() {
+            let limit = assist.policy().frontier_limit;
+            if self.config.corpus.capture_branch_frontiers() {
+                limit.max(self.config.corpus.frontier_limit)
+            } else {
+                limit
+            }
+        } else if self.config.corpus.capture_branch_frontiers() {
             self.config.corpus.frontier_limit
         } else {
             0
@@ -679,6 +768,14 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         // 1. Global state allows (not timed out, not at global limit, no failure found)
         // 2. Worker hasn't reached its specific run limit
         'stop: while shared_state.should_continue() && worker.runs < worker_runs {
+            let hybrid_input = self.try_hybrid_assist(
+                &executor,
+                &frontier_recorder,
+                shared_state,
+                &mut worker.hybrid,
+            );
+            let is_hybrid_input = hybrid_input.is_some();
+            let hybrid_target = hybrid_input.as_ref().map(|(_, target)| target.clone());
             // If counterexample recorded, replay it first, without incrementing runs.
             let (input, fuzz_run) = if worker_id == 0
                 && let Some(failure) = persisted_failure.take()
@@ -699,6 +796,16 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                         seed,
                         failure.fuzz.run,
                         Some(failure.fuzz.worker.unwrap_or(worker_id as u32)),
+                    )),
+                )
+            } else if let Some((input, _)) = hybrid_input {
+                let fuzz_run = self.config.run.unwrap_or(worker.runs + 1);
+                (
+                    input,
+                    Some(FuzzRunMetadata::new(
+                        self.config.seed,
+                        Some(fuzz_run),
+                        Some(worker_id as u32),
                     )),
                 )
             } else {
@@ -760,6 +867,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             };
 
             worker.last_run_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+            let hybrid_candidate = is_hybrid_input.then(|| input.clone());
             match self.single_fuzz(
                 &executor,
                 address,
@@ -771,6 +879,34 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                 Ok(fuzz_outcome) => match fuzz_outcome {
                     FuzzOutcome::Case(case) => {
                         let total_runs = inc_runs();
+                        if case.new_coverage {
+                            shared_state.record_hybrid_global_edge();
+                        }
+                        let hybrid_target_flipped = hybrid_target.as_ref().is_some_and(|target| {
+                            frontier_recorder.replayed_target_flipped(target)
+                        });
+                        if is_hybrid_input && case.new_coverage {
+                            worker.hybrid.useful_candidates =
+                                worker.hybrid.useful_candidates.saturating_add(1);
+                        } else if hybrid_target_flipped && let Some(calldata) = hybrid_candidate {
+                            let inserted = corpus.push_replayed_sequence(
+                                vec![BasicTxDetails {
+                                    warp: None,
+                                    roll: None,
+                                    sender: self.sender,
+                                    call_details: CallDetails {
+                                        target: address,
+                                        calldata,
+                                        value: None,
+                                    },
+                                }],
+                                CorpusInsertionMode::Live,
+                            );
+                            if inserted {
+                                worker.hybrid.corpus_candidates =
+                                    worker.hybrid.corpus_candidates.saturating_add(1);
+                            }
+                        }
 
                         if worker_id == 0 && self.config.corpus.collect_edge_coverage() {
                             if let Some(progress) = progress {
@@ -827,6 +963,10 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                         ..
                     }) => {
                         inc_runs();
+                        if is_hybrid_input {
+                            worker.hybrid.counterexamples =
+                                worker.hybrid.counterexamples.saturating_add(1);
+                        }
                         worker.failure_run = fuzz_run;
 
                         // Only classify magic skip payloads when the revert originates from the
@@ -885,6 +1025,68 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         fuzz_state.log_stats();
 
         Ok(worker)
+    }
+
+    fn try_hybrid_assist(
+        &self,
+        executor: &Executor<FEN>,
+        frontiers: &FuzzFrontierRecorder,
+        shared_state: &SharedFuzzState,
+        stats: &mut HybridFuzzStats,
+    ) -> Option<(Bytes, HybridFuzzTarget)> {
+        let assist = self.hybrid_assist.as_ref()?;
+        let policy = assist.policy();
+        let stalled_for = shared_state.time_since_hybrid_global_edge();
+        let attempts = shared_state.hybrid_attempts.load(Ordering::Relaxed);
+        if !policy.should_attempt(
+            shared_state.total_runs.load(Ordering::Relaxed),
+            stalled_for,
+            attempts,
+            shared_state.hybrid_cooldown_elapsed(),
+        ) {
+            return None;
+        }
+        let _lease = HybridAssistLease::try_acquire()?;
+        let targets = {
+            let attempted_targets =
+                shared_state.hybrid_attempted_targets.lock().expect("hybrid target set poisoned");
+            frontiers.best_hybrid_targets_excluding(policy.attempt_frontier_limit, |key, delta| {
+                attempted_targets.get(&key).is_some_and(|attempted_delta| delta >= *attempted_delta)
+            })
+        };
+        if targets.is_empty() {
+            shared_state.delay_next_hybrid_attempt(policy.cooldown);
+            return None;
+        }
+
+        let mut last_incomplete_attempt = None;
+        for target in targets {
+            let attempt = shared_state.try_start_hybrid_attempt(policy.max_attempts)?;
+            {
+                let mut attempted_targets = shared_state
+                    .hybrid_attempted_targets
+                    .lock()
+                    .expect("hybrid target set poisoned");
+                attempted_targets.insert(target.key(), target.operand_delta());
+            }
+            stats.attempts = stats.attempts.saturating_add(1);
+
+            match assist.solver().solve(executor, target.clone()) {
+                HybridFuzzSolve::Candidate(calldata) => {
+                    shared_state.delay_next_hybrid_attempt(policy.cooldown);
+                    stats.candidates = stats.candidates.saturating_add(1);
+                    return Some((calldata, target));
+                }
+                HybridFuzzSolve::Incomplete(kind) => {
+                    last_incomplete_attempt = Some(attempt);
+                    stats.record_incomplete(kind);
+                }
+            }
+        }
+        if let Some(attempt) = last_incomplete_attempt {
+            shared_state.delay_next_hybrid_attempt(policy.incomplete_cooldown(attempt));
+        }
+        None
     }
 
     /// Determines the number of runs per worker.
